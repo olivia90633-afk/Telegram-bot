@@ -1,4 +1,5 @@
 import os
+import random
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -7,17 +8,58 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from openai import OpenAI
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ======================
+# USER STATE
+# ======================
+user_steps = {}        # message count
+user_used_msgs = {}    # track used messages
+paid_users = set()     # temporary (we’ll persist later)
 
-# Track how many messages each user sent
-user_steps = {}
+FREE_LIMIT = 5
 
-FREE_LIMIT = 5  # after this, we gate deep secrets
+# ======================
+# PRE-SAVED MONEY MESSAGES (FREE)
+# ======================
+FREE_MESSAGES = [
+    "Money doesn’t respond to wishes — it responds to strategy 💼📊",
+    "Most people work hard, few people work smart. Wealth lives in the difference 💡💰",
+    "Salary keeps you busy, systems make you wealthy 📈",
+    "The rich don’t chase money, they build value 💎",
+    "There’s a reason some people escape poverty — they learn different rules 🧠",
+    "Real money is predictable when you understand leverage 🚀",
+    "You don’t need luck to be rich, you need structure 🏗️",
+    "Poverty is expensive. Wealth requires discipline 💼",
+    "People who win financially think long-term, not urgent ⏳",
+    "Money grows faster when emotions are removed 📊",
+]
+
+# ======================
+# PRE-SAVED GATED MESSAGES (AFTER FREE)
+# ======================
+GATED_MESSAGES = [
+    "I can guide you properly, but I won’t mislead you with half-information 💼",
+    "Serious income systems require commitment — not curiosity alone 🔐",
+    "At this stage, guidance must be structured, not random 📈",
+    "This is where most people stop — disciplined ones continue 🚪",
+    "Once access is unlocked, I’ll break things down step by step 💎",
+    "I don’t sell dreams — I teach systems, and systems are premium 🧠",
+    "Wealth blueprints are protected for a reason 🔒",
+    "You’re asking the right questions — now commitment matters 💼",
+]
+
+# ======================
+# PREMIUM MESSAGES (AFTER /paid)
+# ======================
+PREMIUM_MESSAGES = [
+    "Welcome. Now we talk seriously about money and execution 💼🔥",
+    "First rule of wealth: control income before increasing lifestyle 📊",
+    "Money respects structure. Let’s build yours properly 🏗️",
+    "From here, we focus on skills, leverage, and systems 📈",
+    "This is where transformation actually starts 🚀",
+]
 
 # ======================
 # START
@@ -25,6 +67,7 @@ FREE_LIMIT = 5  # after this, we gate deep secrets
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_steps[user_id] = 0
+    user_used_msgs[user_id] = set()
 
     await update.message.reply_text(
         "🔥 *Ola AI*\n\n"
@@ -38,81 +81,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ======================
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_text = update.message.text.strip()
+    user_text = update.message.text.lower().strip()
 
+    # PAID USER FLOW
+    if user_id in paid_users:
+        msg = get_unique_message(user_id, PREMIUM_MESSAGES)
+        await update.message.reply_text(msg)
+        return
+
+    # FREE / GATED FLOW
     step = user_steps.get(user_id, 0)
     user_steps[user_id] = step + 1
 
-    # Decide mode
     if step < FREE_LIMIT:
-        mode = "free"
+        msg = get_unique_message(user_id, FREE_MESSAGES)
     else:
-        mode = "gated"
+        msg = get_unique_message(user_id, GATED_MESSAGES) + \
+              "\n\nType /help when you’re ready to unlock full guidance 💼"
 
-    # ======================
-    # PROMPT
-    # ======================
-    if mode == "free":
-        prompt = f"""
-You are Ola AI, a professional wealth mentor.
-
-Reply intelligently to the user.
-Focus on:
-- Money mindset
-- Business thinking
-- Wealth growth
-- Financial freedom
-- Realistic encouragement
-
-Do NOT repeat ideas.
-Do NOT ask for payment yet.
-Be serious, motivating, persuasive.
-Use classy emojis.
-
-User said:
-"{user_text}"
-"""
-    else:
-        prompt = f"""
-You are Ola AI, a professional wealth mentor.
-
-Reply intelligently to the user.
-You may still talk about money, success, mindset.
-
-BUT:
-- Do NOT reveal deep strategies or step-by-step systems
-- Hint that full guidance requires commitment
-- Encourage subscription in DIFFERENT intelligent ways
-- Do NOT repeat phrases
-- Sound exclusive, premium, disciplined
-
-Examples of tone:
-- "I can guide you properly once access is unlocked"
-- "Serious strategies are reserved for committed minds"
-- "I don’t want to mislead you with half-information"
-
-User said:
-"{user_text}"
-"""
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a serious billionaire mentor AI."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.85,
-        )
-
-        reply = response.choices[0].message.content.strip()
-
-    except Exception:
-        reply = (
-            "Real wealth is built with clarity, patience, and the right guidance 💼📈"
-        )
-
-    await update.message.reply_text(reply)
+    await update.message.reply_text(msg)
 
 # ======================
 # HELP
@@ -129,9 +116,38 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 Olaotan Olamide\n"
         "🔢 `2082773155`\n"
         "━━━━━━━━━━━━━━\n\n"
-        "Once unlocked, I’ll guide you properly 💼🚀",
+        "After payment, type /paid 💰",
         parse_mode="Markdown"
     )
+
+# ======================
+# PAID (TEMP CONFIRM)
+# ======================
+async def paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    paid_users.add(user_id)
+
+    await update.message.reply_text(
+        "✅ Payment noted.\n\n"
+        "Welcome to the serious money side 💼🔥\n"
+        "Let’s begin."
+    )
+
+# ======================
+# HELPERS
+# ======================
+def get_unique_message(user_id, pool):
+    used = user_used_msgs.get(user_id, set())
+    available = [m for m in pool if m not in used]
+
+    if not available:
+        used.clear()
+        available = pool[:]
+
+    msg = random.choice(available)
+    used.add(msg)
+    user_used_msgs[user_id] = used
+    return msg
 
 # ======================
 # MAIN
@@ -141,6 +157,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("paid", paid_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
 
     app.run_polling()
