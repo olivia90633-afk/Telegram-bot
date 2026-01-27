@@ -1,5 +1,4 @@
 import os
-import random
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -10,21 +9,15 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# ======================
-# ENV VARIABLES
-# ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ======================
-# USER STATE
-# ======================
-user_steps = {}      # message count
-user_history = {}    # prevent repetition
+# Track how many messages each user sent
+user_steps = {}
 
-MAX_FREE_MESSAGES = 5
+FREE_LIMIT = 5  # after this, we gate deep secrets
 
 # ======================
 # START
@@ -32,7 +25,6 @@ MAX_FREE_MESSAGES = 5
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_steps[user_id] = 0
-    user_history[user_id] = []
 
     await update.message.reply_text(
         "🔥 *Ola AI*\n\n"
@@ -42,76 +34,88 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ======================
-# MAIN CHAT
+# CHAT
 # ======================
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text.strip()
+    user_text = update.message.text.strip()
 
     step = user_steps.get(user_id, 0)
     user_steps[user_id] = step + 1
 
-    # 🔒 FORCE SUBSCRIPTION AFTER LIMIT
-    if step >= MAX_FREE_MESSAGES:
-        await update.message.reply_text(
-            "💎 You’re clearly serious about money.\n\n"
-            "The next level is reserved for disciplined minds.\n\n"
-            "Type /help to unlock the real blueprint 💰🚀"
-        )
-        return
+    # Decide mode
+    if step < FREE_LIMIT:
+        mode = "free"
+    else:
+        mode = "gated"
 
     # ======================
-    # OPENAI PROMPT
+    # PROMPT
     # ======================
-    prompt = f"""
-You are Ola AI — a serious, elite wealth mentor.
+    if mode == "free":
+        prompt = f"""
+You are Ola AI, a professional wealth mentor.
 
-Rules:
-- Talk ONLY about money, wealth, business, success, freedom.
-- Be professional, confident, teasing, motivating.
-- NEVER repeat previous ideas.
-- Use examples like N500k → N5M → N50M → $1M+.
-- Encourage curiosity.
-- Sound realistic, not scammy.
-- Emojis allowed but classy.
-- Reply intelligently to what user said.
+Reply intelligently to the user.
+Focus on:
+- Money mindset
+- Business thinking
+- Wealth growth
+- Financial freedom
+- Realistic encouragement
 
-User message:
-"{text}"
+Do NOT repeat ideas.
+Do NOT ask for payment yet.
+Be serious, motivating, persuasive.
+Use classy emojis.
+
+User said:
+"{user_text}"
+"""
+    else:
+        prompt = f"""
+You are Ola AI, a professional wealth mentor.
+
+Reply intelligently to the user.
+You may still talk about money, success, mindset.
+
+BUT:
+- Do NOT reveal deep strategies or step-by-step systems
+- Hint that full guidance requires commitment
+- Encourage subscription in DIFFERENT intelligent ways
+- Do NOT repeat phrases
+- Sound exclusive, premium, disciplined
+
+Examples of tone:
+- "I can guide you properly once access is unlocked"
+- "Serious strategies are reserved for committed minds"
+- "I don’t want to mislead you with half-information"
+
+User said:
+"{user_text}"
 """
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a billionaire money mentor."},
+                {"role": "system", "content": "You are a serious billionaire mentor AI."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.9,
+            temperature=0.85,
         )
 
         reply = response.choices[0].message.content.strip()
 
-        # prevent accidental repetition
-        if reply in user_history[user_id]:
-            reply += "\n\nSmart money always looks for the next level 📈💼"
-
-        user_history[user_id].append(reply)
-
     except Exception:
-        # 🔥 FAILSAFE (BOT NEVER GOES SILENT)
-        reply = random.choice([
-            "Money rewards those who act early 💼📈",
-            "The wealthy think differently — I can show you 🧠💰",
-            "There is a system behind every millionaire 💎",
-            "Cashflow beats salary every single time 🔥",
-            "Serious money requires serious mindset 🚀",
-        ])
+        reply = (
+            "Real wealth is built with clarity, patience, and the right guidance 💼📈"
+        )
 
     await update.message.reply_text(reply)
 
 # ======================
-# HELP / SUBSCRIBE
+# HELP
 # ======================
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -125,7 +129,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👤 Olaotan Olamide\n"
         "🔢 `2082773155`\n"
         "━━━━━━━━━━━━━━\n\n"
-        "After payment, type /paid 💰",
+        "Once unlocked, I’ll guide you properly 💼🚀",
         parse_mode="Markdown"
     )
 
