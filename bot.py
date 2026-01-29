@@ -1,359 +1,337 @@
 import os
-import random
-from datetime import datetime, timedelta
 import sqlite3
+import random
+import asyncio
+from datetime import datetime, timedelta
+
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    MessageHandler,
+    filters
+)
 
-# ======================
-# CONFIG
-# ======================
+from openai import OpenAI
+
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 7926402001  # Your Telegram numeric ID
-FREE_LIMIT = 5  # Number of free messages before subscription
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-DB_NAME = "ola_ai.db"
+ADMIN_ID = 7926402001
+DB_FILE = "users.db"
 
-# ======================
-# DATABASE FUNCTIONS
-# ======================
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ================= DATABASE =================
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            username TEXT,
+            message_count INTEGER DEFAULT 0,
             is_paid INTEGER DEFAULT 0,
+            expiry TEXT,
             plan TEXT,
-            expires_at TEXT,
-            messages_sent INTEGER DEFAULT 0,
-            last_active TEXT
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            plan TEXT,
-            amount INTEGER,
-            paid_at TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(user_id)
+            revenue INTEGER DEFAULT 0,
+            reminded INTEGER DEFAULT 0,
+            last_seen TEXT
         )
     """)
     conn.commit()
     conn.close()
 
-def add_or_get_user(user_id, username="Unknown"):
-    conn = sqlite3.connect(DB_NAME)
+def get_user(user_id):
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    user = c.fetchone()
-    if not user:
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def add_user(user_id):
+    if not get_user(user_id):
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
         c.execute(
-            "INSERT INTO users (user_id, username, last_active) VALUES (?, ?, ?)",
-            (user_id, username, datetime.utcnow().isoformat())
+            "INSERT INTO users (user_id, last_seen) VALUES (?, ?)",
+            (user_id, datetime.utcnow().isoformat())
         )
         conn.commit()
-        c.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        user = c.fetchone()
-    conn.close()
-    return user
+        conn.close()
 
-def increment_messages(user_id):
-    conn = sqlite3.connect(DB_NAME)
+def increment_message(user_id):
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "UPDATE users SET messages_sent = messages_sent + 1, last_active=? WHERE user_id=?",
+        "UPDATE users SET message_count = message_count + 1, last_seen=? WHERE user_id=?",
         (datetime.utcnow().isoformat(), user_id)
     )
     conn.commit()
     conn.close()
 
-def set_paid(user_id, plan, duration_days, amount):
-    expires = datetime.utcnow() + timedelta(days=duration_days)
-    conn = sqlite3.connect(DB_NAME)
+def set_paid(user_id, plan, days, amount):
+    expiry = datetime.utcnow() + timedelta(days=days)
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute(
-        "UPDATE users SET is_paid=1, plan=?, expires_at=? WHERE user_id=?",
-        (plan, expires.isoformat(), user_id)
-    )
-    c.execute(
-        "INSERT INTO payments (user_id, plan, amount, paid_at) VALUES (?, ?, ?, ?)",
-        (user_id, plan, amount, datetime.utcnow().isoformat())
-    )
+    c.execute("""
+        UPDATE users SET
+        is_paid=1,
+        expiry=?,
+        plan=?,
+        revenue=revenue+?,
+        reminded=0
+        WHERE user_id=?
+    """, (expiry.isoformat(), plan, amount, user_id))
     conn.commit()
     conn.close()
 
-def revoke_paid(user_id):
-    conn = sqlite3.connect(DB_NAME)
+def revoke_user(user_id):
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute(
-        "UPDATE users SET is_paid=0, plan=NULL, expires_at=NULL WHERE user_id=?",
+        "UPDATE users SET is_paid=0, expiry=NULL, plan=NULL WHERE user_id=?",
         (user_id,)
     )
     conn.commit()
     conn.close()
 
-def check_expiry(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT is_paid, expires_at FROM users WHERE user_id=?", (user_id,))
-    result = c.fetchone()
-    conn.close()
-    if not result:
-        return False
-    is_paid, expires_at = result
-    if not is_paid:
-        return False
-    if expires_at and datetime.utcnow() > datetime.fromisoformat(expires_at):
-        revoke_paid(user_id)
-        return False
-    return True
-
 def get_all_users():
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT * FROM users")
-    users = c.fetchall()
+    c.execute("SELECT user_id FROM users")
+    rows = c.fetchall()
     conn.close()
-    return users
+    return [r[0] for r in rows]
 
-def get_paid_users():
-    conn = sqlite3.connect(DB_NAME)
+def get_paid_users(full=False):
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE is_paid=1")
-    users = c.fetchall()
+    if full:
+        c.execute("SELECT user_id, expiry, reminded FROM users WHERE is_paid=1")
+    else:
+        c.execute("SELECT user_id, expiry FROM users WHERE is_paid=1")
+    rows = c.fetchall()
     conn.close()
-    return users
+    return rows
 
-def get_revenue():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT SUM(amount) FROM payments")
-    total = c.fetchone()[0]
-    conn.close()
-    return total if total else 0
-
-# ======================
-# PRESET MESSAGES
-# ======================
+# ================= MESSAGES =================
 FREE_MESSAGES = [
-    "Money doesn’t respond to wishes — it responds to strategy 💼📊",
-    "Most people work hard, few people work smart 💡💰",
-    "Salary keeps you busy, systems make you wealthy 📈",
-    "The rich don’t chase money, they build value 💎",
-    "There’s a reason some escape poverty — they learn different rules 🧠",
-    "Real money is predictable when you understand leverage 🚀",
-    "You don’t need luck to be rich, you need structure 🏗️",
-    "Poverty is expensive. Wealth requires discipline 💼",
-    "People who win financially think long-term, not urgent ⏳",
-    "Money grows faster when emotions are removed 📊",
+    "Cashflow beats salary every time 💼📈",
+    "Money follows discipline, not wishes 💰",
+    "Wealth is built by systems, not luck 🔥",
+    "People escape poverty by learning skills 🧠",
+    "Trading done right creates freedom 🚀",
+    "Smart money moves silently 💎",
+    "Rich people think in probabilities 📊",
+    "Money respects patience ⏳",
+    "Discipline creates wealth 🛡️",
+    "Skills pay forever 💼",
+    "Trading rewards calm minds 🧘",
+    "You don’t chase money, you attract it 🧲",
+    "Consistency beats motivation 🔁",
+    "Every wealthy person followed a system 📈",
+    "Learning changes income 💡",
+    "Risk control is power 🛡️",
+    "Smart decisions compound 💎",
+    "Money loves clarity 🎯",
+    "Wealth is intentional 💰",
+    "Focus creates fortune 🔥"
 ]
 
-GATED_MESSAGES = [
-    "I can guide you properly, but only serious ones continue 💼",
-    "Serious income systems require commitment 🔐",
-    "Guidance must be structured, not random 📈",
-    "Once access is unlocked, I’ll break things down step by step 💎",
-    "Wealth blueprints are protected for a reason 🔒",
-    "You’re asking the right questions — now commitment matters 💼",
+DAILY_TIPS = [  # 20 tips (as you requested)
+    "Never trade emotionally. Calm decisions grow accounts 📊",
+    "Protect capital first. Profit comes second 🛡️",
+    "One asset mastery beats ten assets confusion 🎯",
+    "Stop trading after 2 losses. Discipline saves money 💼",
+    "Trade higher timeframes for clarity ⏱️",
+    "Never increase lot size after a loss 🚫",
+    "Trading is patience, not speed ⏳",
+    "Consistency builds wealth 🔁",
+    "Journal every trade 📒",
+    "Wait for confirmation before entry 📈",
+    "Avoid revenge trading 🧠",
+    "Price action leads indicators 📊",
+    "Your mindset is your edge 💎",
+    "Losses are tuition 📚",
+    "No setup, no trade ❌",
+    "Rules make traders rich 💼",
+    "Calm traders survive 🧘",
+    "Risk 2–5% max 🛡️",
+    "Discipline compounds 💰",
+    "Systems create freedom 🚀"
 ]
 
-PREMIUM_MESSAGES = [
-    "Welcome to premium guidance 💼🔥",
-    "First rule: control income before increasing lifestyle 📊",
-    "Money respects structure. Let’s build yours properly 🏗️",
-    "From here, we focus on skills, leverage, and systems 📈",
-    "This is where transformation actually starts 🚀",
-]
+SYSTEM_PROMPT = """
+You are Ola AI, a professional trading mentor.
+You ONLY teach IQ Option trading, money discipline, risk management, and wealth mindset.
+Be human, serious, encouraging, and intelligent.
+Never repeat phrases.
+"""
 
-user_used_msgs = {}  # to track sent messages
-
-def get_unique_message(user_id, pool):
-    used = user_used_msgs.get(user_id, set())
-    available = [m for m in pool if m not in used]
-    if not available:
-        used.clear()
-        available = pool[:]
-    msg = random.choice(available)
-    used.add(msg)
-    user_used_msgs[user_id] = used
-    return msg
-
-# ======================
-# BOT COMMANDS
-# ======================
+# ================= HANDLERS =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
-    add_or_get_user(user_id, username)
+    uid = update.effective_user.id
+    add_user(uid)
     await update.message.reply_text(
-        "🔥 *Ola AI*\n\n"
-        "Do you want to start making serious money and escape poverty?\n\n"
-        "Reply *YES* 💼💰",
-        parse_mode="Markdown"
+        "🔥 Ola AI\n\nDo you want to start making serious money and escape poverty?\n\nReply YES 💼💰"
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "💎 *SUBSCRIPTION PLANS* 💎\n\n"
+        "💎 SUBSCRIPTION PLANS 💎\n\n"
         "🔥 ₦2,000 → 2 Days\n"
         "💎 ₦6,000 → 1 Week\n"
         "💰 ₦25,000 → 1 Month\n"
         "👑 ₦100,000 → Lifetime\n\n"
         "━━━━━━━━━━━━━━\n"
-        "🏦 *Kuda Bank*\n"
-        "👤 Olaotan Olamide\n"
-        "🔢 `2082773155`\n"
+        "🏦 Bank: Kuda Bank\n"
+        "👤 Name: Olaotan Olamide\n"
+        "🔢 Account No: 2082773155\n"
         "━━━━━━━━━━━━━━\n\n"
-        "After payment, type /paid 💰",
-        parse_mode="Markdown"
+        "After payment, type /paid 💰"
     )
 
 async def paid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     await update.message.reply_text(
-        "✅ Payment noted.\n\n"
-        "Admin will confirm your subscription shortly 💼"
+        "✅ Payment notice received 💸\n⏳ Admin will confirm shortly."
     )
-    # Notify admin
     await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"💰 User {user_id} requested subscription confirmation."
+        ADMIN_ID,
+        f"💰 PAYMENT NOTICE\nUser ID: `{update.effective_user.id}`",
+        parse_mode="Markdown"
     )
 
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
-    add_or_get_user(user_id, username)
-    increment_messages(user_id)
-
-    # Check expiry
-    if check_expiry(user_id):
-        msg = get_unique_message(user_id, PREMIUM_MESSAGES)
-        await update.message.reply_text(msg)
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         return
-
-    # Determine step
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT messages_sent FROM users WHERE user_id=?", (user_id,))
-    step = c.fetchone()[0]
-    conn.close()
-
-    if step <= FREE_LIMIT:
-        msg = get_unique_message(user_id, FREE_MESSAGES)
-    else:
-        msg = get_unique_message(user_id, GATED_MESSAGES) + "\n\nType /help when ready to unlock full guidance 💼"
-    await update.message.reply_text(msg)
-
-# ======================
-# ADMIN COMMANDS
-# ======================
-async def admin_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ You are not authorized.")
-        return
-
-    total_users = len(get_all_users())
-    paid_users = len(get_paid_users())
-    revenue = get_revenue()
-
     await update.message.reply_text(
-        f"🔥 Ola Admin Dashboard 🔥\n\n"
-        f"Total Users: {total_users}\n"
-        f"Paid Users: {paid_users}\n"
-        f"Revenue: ₦{revenue}\n\n"
-        "Commands:\n"
-        "✅ /confirm <user_id> <plan>\n"
-        "❌ /revoke <user_id>\n"
-        "📊 /stats\n"
-        "📢 /broadcast <message>"
+        "🔥 ADMIN DASHBOARD 🔥\n\n"
+        "/confirm <user_id> <2d|1w|1m|life>\n"
+        "/revoke <user_id>\n"
+        "/stats\n"
+        "/broadcast <msg>\n"
+        "/expirelist\n"
+        "/topusers\n"
+        "/sendtip"
     )
 
-async def confirm_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ Not authorized.")
+async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /confirm <user_id> <plan>")
         return
 
-    try:
-        args = context.args
-        target_id = int(args[0])
-        plan = args[1].lower()
-        plan_days = {"2d":2, "1w":7, "1m":30, "life":365*50}  # life = 50 years
-        amount_dict = {"2d":2000, "1w":6000, "1m":25000, "life":100000}
-        set_paid(target_id, plan, plan_days[plan], amount_dict[plan])
-        await update.message.reply_text(f"✅ User {target_id} confirmed for {plan} plan.")
-        await context.bot.send_message(chat_id=target_id, text="💎 Your subscription has been activated! Enjoy premium guidance 💼🔥")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+    uid = int(context.args[0])
+    plan = context.args[1]
 
-async def revoke_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id != ADMIN_ID:
-        await update.message.reply_text("❌ Not authorized.")
+    plans = {
+        "2d": (2, 2000),
+        "1w": (7, 6000),
+        "1m": (30, 25000),
+        "life": (36500, 100000)
+    }
+
+    if plan not in plans:
+        await update.message.reply_text("Invalid plan.")
         return
-    try:
-        target_id = int(context.args[0])
-        revoke_paid(target_id)
-        await update.message.reply_text(f"❌ User {target_id} subscription revoked.")
-        await context.bot.send_message(chat_id=target_id, text="❌ Your subscription has been revoked by admin.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+
+    days, amount = plans[plan]
+    set_paid(uid, plan, days, amount)
+
+    await update.message.reply_text("✅ User confirmed.")
+    await context.bot.send_message(uid, "💎 Subscription confirmed. Welcome to wealth mentorship 🤑")
+
+async def revoke(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uid = int(context.args[0])
+    revoke_user(uid)
+    await update.message.reply_text("❌ User revoked.")
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Not authorized.")
         return
-    total_users = len(get_all_users())
-    paid_users = len(get_paid_users())
-    revenue = get_revenue()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM users WHERE is_paid=1")
+    paid = c.fetchone()[0]
+    c.execute("SELECT SUM(revenue) FROM users")
+    revenue = c.fetchone()[0] or 0
+    conn.close()
+
     await update.message.reply_text(
-        f"📊 Stats:\nTotal Users: {total_users}\nPaid Users: {paid_users}\nRevenue: ₦{revenue}"
+        f"📊 STATS\n\nUsers: {total}\nPaid: {paid}\nRevenue: ₦{revenue}"
     )
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Not authorized.")
         return
-    try:
-        msg = " ".join(context.args)
-        users = get_all_users()
-        count = 0
-        for u in users:
-            try:
-                await context.bot.send_message(chat_id=u[0], text=msg)
-                count += 1
-            except:
-                continue
-        await update.message.reply_text(f"📢 Broadcast sent to {count} users.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}")
+    msg = " ".join(context.args)
+    for uid in get_all_users():
+        try:
+            await context.bot.send_message(uid, msg)
+        except:
+            pass
+    await update.message.reply_text("📢 Broadcast sent.")
 
-# ======================
-# MAIN
-# ======================
-def main():
+async def sendtip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    tip = random.choice(DAILY_TIPS)
+    sent = 0
+    for uid, expiry in get_paid_users():
+        if expiry and datetime.fromisoformat(expiry) > datetime.utcnow():
+            try:
+                await context.bot.send_message(uid, f"💎 Premium Tip\n\n{tip}")
+                sent += 1
+            except:
+                pass
+    await update.message.reply_text(f"✅ Tip sent to {sent} users.")
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    add_user(uid)
+    increment_message(uid)
+
+    user = get_user(uid)
+    is_paid = user[2]
+    expiry = user[3]
+
+    if is_paid and expiry and datetime.fromisoformat(expiry) > datetime.utcnow():
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": update.message.text}
+            ]
+        )
+        await update.message.reply_text(response.choices[0].message.content)
+    else:
+        await update.message.reply_text(random.choice(FREE_MESSAGES))
+
+# ================= MAIN =================
+async def main():
     init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # User commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("paid", paid_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat))
-
-    # Admin commands
-    app.add_handler(CommandHandler("admin", admin_dashboard))
-    app.add_handler(CommandHandler("confirm", confirm_user))
-    app.add_handler(CommandHandler("revoke", revoke_user))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("confirm", confirm))
+    app.add_handler(CommandHandler("revoke", revoke))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("broadcast", broadcast, filters=filters.TEXT))
+    app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("sendtip", sendtip))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
